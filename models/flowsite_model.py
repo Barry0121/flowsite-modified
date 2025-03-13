@@ -11,7 +11,7 @@ from e3nn import o3
 from torch.nn import ModuleList
 from torch_geometric.nn import PNAConv, BatchNorm
 from torch_geometric.utils import unbatch
-from torch_scatter import scatter_mean
+from torch_scatter import scatter_mean, scatter_softmax, scatter_sum
 
 from models.invariant_layers import InvariantLayer
 from models.pytorch_modules import Linear, Encoder
@@ -24,6 +24,37 @@ from utils.simdesign_utils import gather_nodes, _dihedrals, _orientations_coarse
 
 
 class FlowSiteModel(nn.Module):
+    """
+    Main model for FlowSite that predicts protein residue types for binding sites.
+
+    This model combines tensor field networks (TFN) and invariant networks for
+    protein-ligand binding site design. It can generate residue types based on
+    ligand geometry and protein backbone structure.
+
+    The model consists of several components:
+    1. Ligand and protein feature embedders
+    2. TFN for learning 3D equivariant representations
+    3. Invariant networks for learning protein-ligand interactions
+    4. Decoders for residue type and angle prediction
+
+    Args:
+        args (object): Configuration object with the following attributes:
+            - fold_dim (int): Dimension of the invariant network embeddings
+            - num_inv_layers (int): Number of invariant network layers
+            - use_tfn (bool): Whether to use tensor field networks
+            - use_inv (bool): Whether to use invariant networks
+            - ignore_lig (bool): Whether to ignore ligand features
+            - lig2d_mpnn (bool): Whether to use 2D message passing for ligands
+            - fancy_init (bool): Whether to use special weight initialization
+            - self_condition_inv (bool): Whether to use self-conditioning in invariant net
+            - time_condition_inv (bool): Whether to use time conditioning in invariant net
+            - time_condition_tfn (bool): Whether to use time conditioning in tensor net
+            - num_angle_pred (int): Number of angles to predict
+            - drop_tfn_feat (bool): Whether to drop tensor field features
+            - ns (int): Number of scalar features
+            - nv (int): Number of vector features
+        device (torch.device): Device to run the model on (CPU or GPU)
+    """
     def __init__(self, args, device):
         super(FlowSiteModel, self).__init__()
         self.args = args
@@ -104,18 +135,89 @@ class FlowSiteModel(nn.Module):
         if self.args.use_tfn:
             self.tfn = TensorFieldNet(args, device)
             if not args.drop_tfn_feat:
+                # Make sure that args.drop_tfn_feat is always set to False when you're running with args.use_tfn = True and args.use_inv = False
                 self.lig_tfn2inv = nn.Sequential(Linear(args.ns, args.ns), nn.ReLU(), Linear(args.ns, fold_dim))
                 self.rec_tfn2inv = nn.Sequential(Linear(args.ns, args.ns), nn.ReLU(), Linear(args.ns, fold_dim))
         assert not ((args.time_condition_inv or args.time_condition_tfn) and args.ignore_lig), "It does not make sense to use time conditioning without the ligand and therefore without diffusion."
 
+        # ADD: energy prediction components
+        if self.args.energy_predictor:
+            # Attention mechanism for protein and ligand nodes
+            self.protein_attention = nn.Sequential(nn.Linear(fold_dim, fold_dim // 2), nn.ReLU(), nn.Linear(fold_dim // 2, 1))
+            self.ligand_attention = nn.Sequential(nn.Linear(fold_dim, fold_dim // 2), nn.ReLU(), nn.Linear(fold_dim // 2, 1))
+
+            # Interaction feature processing (input dim = protein + ligand + edge features)
+            self.interaction_mlp = nn.Sequential(nn.Linear(fold_dim * 2 + fold_dim, fold_dim), nn.ReLU(), nn.Dropout(0.1), nn.Linear(fold_dim, fold_dim))
+
+            # Attention for interaction features
+            self.interaction_attention = nn.Sequential(nn.Linear(fold_dim, fold_dim // 2), nn.ReLU(), nn.Linear(fold_dim // 2, 1))
+
+            # Final energy prediction MLP (input dim = protein + ligand + interaction features)
+            self.energy_mlp = nn.Sequential(
+                nn.Linear(fold_dim * 3, fold_dim), nn.ReLU(), nn.Dropout(0.1), nn.Linear(fold_dim, fold_dim // 2),
+                nn.ReLU(), nn.Dropout(0.1), nn.Linear(fold_dim // 2, 1)
+            )
+
+    def attention_pooling(self, node_features, attention_network, batch_indices, num_graphs):
+        # Calculate attention scores
+        attention_scores = attention_network(node_features)
+        # Apply softmax per graph
+        attention_weights = scatter_softmax(attention_scores, batch_indices, dim=0)
+        # Weighted average
+        weighted_features = node_features * attention_weights
+        pooled_features = scatter_sum(weighted_features, batch_indices, dim=0, dim_size=num_graphs)
+        return pooled_features
+
+    def compute_interaction_features(self, protein_nodes, ligand_nodes, cross_idx, cross_ea, protein_batch, num_graphs):
+        # Extract interacting protein and ligand nodes
+        protein_interacting = protein_nodes[cross_idx[1]]
+        ligand_interacting = ligand_nodes[cross_idx[0]]
+        # Combine with edge features
+        interaction_features = torch.cat([protein_interacting, ligand_interacting, cross_ea], dim=1)
+        # Process through MLP
+        interaction_features = self.interaction_mlp(interaction_features)
+        # Use attention to pool by complex
+        complex_ids = protein_batch[cross_idx[1]]
+        interaction_pooled = self.attention_pooling(
+            interaction_features,
+            self.interaction_attention,
+            complex_ids,
+            num_graphs
+        )
+        return interaction_pooled
+
     def forward(self, data, x_self=None, x_prior= None):
+        """
+        Forward pass of the FlowSiteModel.
+
+        Processes protein and ligand data through tensor field networks and/or
+        invariant networks to predict residue types and ligand positions.
+
+        Args:
+            data (HeteroData): PyTorch Geometric heterogeneous graph data object containing:
+                - 'protein': Protein node features and positions
+                - 'ligand': Ligand node features and positions
+                - Edge indices and attributes for bonds and spatial neighbors
+            x_self (torch.Tensor, optional): Self-conditioning position input. Default: None
+            x_prior (torch.Tensor, optional): Prior distribution position input. Default: None
+
+        Returns:
+            tuple: A tuple containing:
+                - logits (torch.Tensor): Residue type prediction logits (shape: [num_nodes, num_residue_types])
+                - lig_pos_stack (torch.Tensor): Stack of ligand positions from each layer
+                  or single ligand position if TFN is not used
+                - angles (torch.Tensor, optional): Predicted angles in sin/cos encoding
+                  (shape: [num_nodes, num_angles, 2]) if num_angle_pred > 0, otherwise None
+        """
         if self.args.use_tfn:
             lig_na_tfn, rec_na_tfn, lig_pos_stack = self.tfn(data, x_self, x_prior)
             if self.args.tfn_detach:
                 lig_na_tfn, rec_na_tfn = lig_na_tfn.detach(), rec_na_tfn.detach()
             data['ligand'].pos = lig_pos_stack[-1].detach()
 
+        # MODIFY THIS SECTION IF WE WANT TO GET ENERGY RANKING
         if self.args.use_inv:
+            # 1. Create Ligand Node & Edge Features and Build Ligand Graph
             if self.args.ignore_lig:
                 lig_na, lig_ea, lig_idx, cross_idx, cross_ea = None, None, None, None, None
             else:
@@ -124,6 +226,7 @@ class FlowSiteModel(nn.Module):
                 lig_idx, lig_ea = self.lig_edge_builder(data, lig_ea)
                 cross_idx, cross_ea = self.cross_edge_builder(data)
 
+            # 2. Build Protein Node & Edge Features
             rec_na, rec_ea, rec_idx = self.inv_embedder(data)
             if self.args.self_condition_inv and self.args.residue_loss_weight > 0:
                 if self.args.standard_style_self_condition_inv:
@@ -135,6 +238,7 @@ class FlowSiteModel(nn.Module):
                 if self.args.self_condition_bit:
                     rec_na = rec_na + self.self_condition_bit_encoder(data.self_condition_bit[data['protein'].batch.long()])
 
+            # 3. Apply MPNN on Ligand features and add the output to Protein node features, incoporating Ligand information into Protein features
             if self.args.lig2d_mpnn:
                 mpnn_lig_ea = self.lig_edge_embedder(data['ligand', 'bond_edge', 'ligand'].edge_attr)
                 mpnn_lig_na = self.lig_node_embedder(data["ligand"].feat)
@@ -145,6 +249,7 @@ class FlowSiteModel(nn.Module):
                 mpnn_lig_na_pooled = scatter_mean(mpnn_lig_na, data['ligand'].batch, dim=0)
                 rec_na = rec_na + mpnn_lig_na_pooled[data['protein'].batch.long()]
 
+            # 4. Add time encoding to the Ligand and Protein Node & Edge features
             if self.args.time_condition_inv:
                 temb_inv = self.time_encoder_inv(data.t01 if self.args.correct_time_condition else data.normalized_t)
                 rec_na = rec_na + temb_inv[data['protein'].batch.long()]
@@ -155,16 +260,19 @@ class FlowSiteModel(nn.Module):
             else:
                 temb_inv = None
 
-
+            # 5. Transform TFN sturcutral output and add it to the node features
             if self.args.use_tfn and not self.args.drop_tfn_feat:
                 lig_na = lig_na + self.lig_tfn2inv(lig_na_tfn[:, :self.args.ns])
                 rec_na = rec_na + self.rec_tfn2inv(rec_na_tfn[:, :self.args.ns])
 
+            # 6. Apply all the invariant layers to the finalized features
             for inv_layer in self.inv_layers:
                 rec_na, rec_ea, lig_na, lig_ea, cross_ea = inv_layer(data, rec_idx, rec_na, rec_ea, lig_idx, lig_na, lig_ea, cross_idx, cross_ea, temb_inv)
         else:
+            # If we don't apply use_inv, we still get the protein node feature just from structure information, without MPNN and time embedding.
             rec_na = self.rec_tfn2inv(rec_na_tfn[:, :self.args.ns])
 
+        # Get the residue logits and angle output
         logits = self.decoder(rec_na)
         if self.args.num_angle_pred > 0:
             angle_na = self.angle_linear(rec_na) + self.angle_linear_skip(rec_na)
@@ -174,9 +282,82 @@ class FlowSiteModel(nn.Module):
         else:
             angles = None
 
-        return logits, lig_pos_stack if self.args.use_tfn else torch.stack([data['ligand'].pos]), angles
+        # Calculate binding energy
+        binding_energy = None
+        if self.energy_predictor and not self.args.ignore_lig and not (lig_na is None):
+            # Get the number of graphs in the batch (correspond to the number of ligands)
+            num_graphs = data.num_graphs
+
+            # Apply attention pooling to protein and ligand features
+            protein_pooled = self.attention_pooling(
+                rec_na,
+                self.protein_attention,
+                data['protein'].batch,
+                num_graphs
+            )
+            ligand_pooled = self.attention_pooling(
+                lig_na,
+                self.ligand_attention,
+                data['ligand'].batch,
+                num_graphs
+            )
+
+            # Compute interaction features
+            interaction_pooled = self.compute_interaction_features(
+                rec_na,
+                lig_na,
+                cross_idx,
+                cross_ea,
+                data['protein'].batch,
+                num_graphs
+            )
+
+            # Concatenate all features for the final energy prediction
+            complex_features = torch.cat([protein_pooled, ligand_pooled, interaction_pooled], dim=1)
+            binding_energy = self.energy_mlp(complex_features)
+
+
+        return (
+            logits,
+            lig_pos_stack if self.args.use_tfn else torch.stack([data['ligand'].pos]), # if not TFN, return the original positions but stacked.
+            angles,
+            binding_energy
+        )
 
 class TensorFieldNet(nn.Module):
+    """
+    Tensor Field Network component of FlowSiteModel.
+
+    This network learns 3D equivariant representations of protein and ligand structures.
+    It processes geometric features and applies tensor field convolutions while
+    respecting 3D rotational equivariance.
+
+    The network consists of:
+    1. Feature irreps definition that specifies the rotation properties
+    2. Embedders for node and edge features
+    3. Multiple TFN layers that update ligand and protein representations
+
+    Args:
+        args (object): Configuration object with the following attributes:
+            - ns (int): Number of scalar features
+            - nv (int): Number of vector features
+            - order (int): Maximum tensor order (0=scalar, 1=vector, etc.)
+            - sh_lmax (int): Maximum degree of spherical harmonics
+            - protein_radius (float): Radius for protein graph construction
+            - radius_emb_dim (int): Dimension for radius embeddings
+            - fancy_init (bool): Whether to use special weight initialization
+            - tfn_pifold_feat (bool): Whether to use PiFold features
+            - self_condition_inv (bool): Whether to use self-conditioning
+            - residue_loss_weight (float): Weight for residue loss
+            - no_tfn_self_condition_inv (bool): Whether to disable self-conditioning
+            - tfn_use_aa_identities (bool): Whether to use amino acid identities
+            - time_condition_tfn (bool): Whether to use time conditioning
+            - time_emb_type (str): Type of time embedding
+            - time_emb_dim (int): Dimension of time embeddings
+            - num_tfn_layers (int): Number of tensor field network layers
+            - no_tfn_vector_inputs (bool): Whether to disable vector inputs
+        device (torch.device): Device to run the model on (CPU or GPU)
+    """
     def __init__(self, args, device):
         super(TensorFieldNet, self).__init__()
         self.args = args
@@ -236,6 +417,26 @@ class TensorFieldNet(nn.Module):
         self.tfn_layers = nn.ModuleList([RefinementTFNLayer(args, last_layer=i == (args.num_tfn_layers - 1)) for i in range(args.num_tfn_layers)])
 
     def forward(self, data, x_self=None, x_prior=None):
+        """
+        Forward pass of the TensorFieldNet.
+
+        Constructs and processes protein and ligand data through tensor field network
+        layers to produce equivariant representations and updated ligand positions.
+
+        Args:
+            data (HeteroData): PyTorch Geometric heterogeneous graph data object containing:
+                - 'protein': Protein node features and positions
+                - 'ligand': Ligand node features and positions
+                - Edge indices and attributes for bonds and spatial neighbors
+            x_self (torch.Tensor, optional): Self-conditioning position input for ligand. Default: None
+            x_prior (torch.Tensor, optional): Prior distribution position input for ligand. Default: None
+
+        Returns:
+            tuple: A tuple containing:
+                - lig_na (torch.Tensor): Updated ligand node attributes
+                - rec_na (torch.Tensor): Updated receptor (protein) node attributes
+                - lig_pos_list (torch.Tensor): Stack of ligand positions from each layer
+        """
         lig_pos = data["ligand"].pos
         rec_cg = self.build_cg(
             pos=data["protein"].pos,
@@ -278,6 +479,23 @@ class TensorFieldNet(nn.Module):
         return lig_na, rec_na, torch.stack(lig_pos_list)
 
 class LigEdgeBuilder(nn.Module):
+    """
+    Builds edge features for ligand graphs.
+
+    This module constructs edge representations for ligands by:
+    1. Building a graph with both bond-based and distance-based edges
+    2. Computing edge vectors and embeddings
+    3. Producing edge features for use in message passing
+
+    Args:
+        args (object): Configuration object with the following attributes:
+            - protein_radius (float): Radius for graph construction
+            - radius_emb_dim (int): Dimension for radius embeddings
+            - fold_dim (int): Dimension of the network embeddings
+            - fancy_init (bool): Whether to use special weight initialization
+            - lig_radius (float): Radius for ligand graph construction
+        device (torch.device): Device to run the model on (CPU or GPU)
+    """
     def __init__(self, args, device):
         super(LigEdgeBuilder, self).__init__()
         self.args = args
@@ -293,6 +511,20 @@ class LigEdgeBuilder(nn.Module):
             Linear(args.fold_dim, args.fold_dim, init="final" if args.fancy_init else "default"),
         )
     def forward(self, data, lig_ea):
+        """
+        Forward pass of the LigEdgeBuilder.
+
+        Builds ligand-ligand edges and computes edge features.
+
+        Args:
+            data (HeteroData): PyTorch Geometric heterogeneous graph data object
+            lig_ea (torch.Tensor): Existing ligand edge attributes
+
+        Returns:
+            tuple: A tuple containing:
+                - edge_index (torch.Tensor): Edge indices for ligand graph
+                - edge_attr (torch.Tensor): Edge attributes for ligand graph
+        """
         edge_index, edge_attr = build_cg_general(
             pos=data['ligand'].pos,
             edge_attr=lig_ea,
@@ -307,6 +539,23 @@ class LigEdgeBuilder(nn.Module):
         return edge_index, edge_attr
 
 class CrossEdgeBuilder(nn.Module):
+    """
+    Builds edge features between protein and ligand graphs.
+
+    This module creates cross-graph connections between proteins and ligands by:
+    1. Building a radius graph between protein and ligand nodes
+    2. Computing vectors between atoms from different molecules
+    3. Embedding these edge features for cross-molecule communication
+
+    Args:
+        args (object): Configuration object with the following attributes:
+            - protein_radius (float): Radius for graph construction
+            - radius_emb_dim (int): Dimension for radius embeddings
+            - fold_dim (int): Dimension of the network embeddings
+            - fancy_init (bool): Whether to use special weight initialization
+            - cross_radius (float): Radius for cross-graph construction
+        device (torch.device): Device to run the model on (CPU or GPU)
+    """
     def __init__(self, args, device):
         super(CrossEdgeBuilder, self).__init__()
         self.args = args
@@ -323,6 +572,19 @@ class CrossEdgeBuilder(nn.Module):
         )
 
     def forward(self, data):
+        """
+        Forward pass of the CrossEdgeBuilder.
+
+        Builds protein-ligand cross-edges and computes edge features.
+
+        Args:
+            data (HeteroData): PyTorch Geometric heterogeneous graph data object
+
+        Returns:
+            tuple: A tuple containing:
+                - cross_idx (torch.Tensor): Edge indices for cross-graph
+                - edge_attr (torch.Tensor): Edge attributes for cross-graph
+        """
         cross_idx, _ = build_cg_general(
             pos=(data["protein"].pos, data['ligand'].pos),
             edge_attr=None,
@@ -351,6 +613,27 @@ def build_cg_general(
     batch=None,
     radius=None,
 ):
+    """
+    Builds a general computational graph with optional radius-based edges.
+
+    This function constructs a graph from node positions, adding radius-based
+    edges if requested, and returns the combined edge index and attributes.
+
+    Args:
+        pos (torch.Tensor or tuple): Node positions (single tensor) or
+            (pos1, pos2) for cross-graphs
+        edge_attr (torch.Tensor): Edge features for existing edges
+        edge_index (torch.Tensor): Existing edge indices
+        batch (torch.Tensor or tuple, optional): Batch assignments for nodes
+            or (batch1, batch2) for cross-graphs. Default: None
+        radius (float or tuple, optional): Cutoff radius for adding distance-based edges
+            or (radius1, radius2) for cross-graphs. Default: None
+
+    Returns:
+        tuple: A tuple containing:
+            - edge_index (torch.Tensor): Combined edge indices
+            - edge_attr (torch.Tensor): Combined edge attributes
+    """
     if isinstance(pos, tuple):
         pos1, pos2 = pos
         batch1, batch2 = batch or (None, None)
@@ -376,13 +659,58 @@ def build_cg_general(
             edge_attr = F.pad(edge_attr, (0, 0, 0, radius_edge_idx.shape[-1]))
 
     return edge_index, edge_attr
+
 def get_edge_attr(conv_graph, node_attr1, node_attr2=None, ns=None):
+    """
+    Constructs edge attributes by combining edge and node features.
+
+    This function combines edge attributes from the graph with attributes
+    from the source and destination nodes to create rich edge representations.
+
+    Args:
+        conv_graph (ConvGraph): Graph container with edge attributes and indices
+        node_attr1 (torch.Tensor): Source node attributes
+        node_attr2 (torch.Tensor, optional): Destination node attributes.
+            If None, uses node_attr1. Default: None
+        ns (int, optional): Number of scalar features to use from node attributes.
+            Default: None
+
+    Returns:
+        torch.Tensor: Combined edge attributes
+    """
     if node_attr2 is None:
         node_attr2 = node_attr1
     src, dst = conv_graph.idx
     return torch.cat([conv_graph.attr, node_attr1[src, :ns], node_attr2[dst, :ns]], -1)
 
 class PiFoldEmbedder(nn.Module):
+    """
+    Protein embedding network based on the PiFold architecture.
+
+    This module creates feature-rich embeddings of protein structures by:
+    1. Processing protein backbone atom positions (N, CA, C, O)
+    2. Computing internal coordinates (distances, angles, dihedrals)
+    3. Generating node and edge features for the protein graph
+
+    The embedder uses multiple types of features:
+    - Distance-based features between atom pairs
+    - Angular features from torsion angles
+    - Directional features from local coordinate frames
+
+    Args:
+        args (object): Configuration object with the following attributes:
+            - fold_dim (int): Dimension of the network embeddings
+            - k_neighbors (int): Number of neighbors for graph construction
+            - virtual_num (int): Number of virtual atoms
+            - node_dist (bool): Whether to use distance node features
+            - node_angle (bool): Whether to use angle node features
+            - node_direct (bool): Whether to use directional node features
+            - edge_dist (bool): Whether to use distance edge features
+            - edge_angle (bool): Whether to use angle edge features
+            - edge_direct (bool): Whether to use directional edge features
+        device (torch.device): Device to run the model on (CPU or GPU)
+        dim (int, optional): Custom embedding dimension. Default: None
+    """
     def __init__(self, args, device, dim=None):
         super(PiFoldEmbedder, self).__init__()
         self.args = args
@@ -436,7 +764,22 @@ class PiFoldEmbedder(nn.Module):
         )
         self.W_e = nn.Linear(fold_dim, fold_dim, bias=True)
         self._init_params()
+
     def forward(self,data):
+        """
+        Forward pass of the PiFoldEmbedder.
+
+        Computes rich protein structure representations based on backbone atoms.
+
+        Args:
+            data (HeteroData): PyTorch Geometric heterogeneous graph data object
+
+        Returns:
+            tuple: A tuple containing:
+                - rec_na (torch.Tensor): Receptor (protein) node attributes
+                - rec_ea (torch.Tensor): Receptor (protein) edge attributes
+                - rec_idx (torch.Tensor): Receptor (protein) edge indices
+        """
         start = time.time()
         unbatched_pos = unbatch(data['protein'].pos, data['protein'].batch)
         pos_N = data['protein'].pos_N

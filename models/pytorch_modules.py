@@ -13,6 +13,18 @@ if deepspeed_is_installed:
     import deepspeed
 
 class Encoder(torch.nn.Module):
+    """
+    Embeds categorical features into a continuous vector space.
+
+    This module takes one-hot or integer encoded categorical features and embeds
+    them into a continuous vector space. Multiple categorical features are embedded
+    separately and then summed to form the final embedding.
+
+    Args:
+        emb_dim (int): Embedding dimension for each categorical feature
+        feature_dims (list): List of integers representing the number of possible
+                            values for each categorical feature
+    """
     def __init__(self, emb_dim, feature_dims):
         # first element of feature_dims is a list with the length of each categorical feature
         super(Encoder, self).__init__()
@@ -31,6 +43,15 @@ class Encoder(torch.nn.Module):
         return x_embedding
 
 def _prod(nums):
+    """
+    Calculates the product of all elements in a sequence.
+
+    Args:
+        nums (sequence): Sequence of numbers
+
+    Returns:
+        Product of all numbers in the sequence
+    """
     out = 1
     for n in nums:
         out = out * n
@@ -38,6 +59,16 @@ def _prod(nums):
 
 
 def _calculate_fan(linear_weight_shape, fan="fan_in"):
+    """
+    Calculates the fan-in, fan-out, or fan-average for weight initialization.
+
+    Args:
+        linear_weight_shape (tuple): Shape of the weights tensor (fan_out, fan_in)
+        fan (str): Type of fan to calculate - "fan_in", "fan_out", or "fan_avg"
+
+    Returns:
+        int: The calculated fan value
+    """
     fan_out, fan_in = linear_weight_shape
 
     if fan == "fan_in":
@@ -53,6 +84,17 @@ def _calculate_fan(linear_weight_shape, fan="fan_in"):
 
 
 def trunc_normal_init_(weights, scale=1.0, fan="fan_in"):
+    """
+    Initializes weights using a truncated normal distribution.
+
+    Samples from a truncated normal distribution and scales the values
+    based on the fan value.
+
+    Args:
+        weights (torch.Tensor): Tensor to initialize
+        scale (float): Scaling factor. Default: 1.0
+        fan (str): Type of fan to use for scaling. Default: "fan_in"
+    """
     shape = weights.shape
     f = _calculate_fan(shape, fan)
     scale = scale / max(1, f)
@@ -64,33 +106,97 @@ def trunc_normal_init_(weights, scale=1.0, fan="fan_in"):
     samples = np.reshape(samples, shape)
     with torch.no_grad():
         weights.copy_(torch.tensor(samples, device=weights.device))
+
 def lecun_normal_init_(weights):
+    """
+    Applies LeCun normal initialization to weights.
+
+    LeCun initialization scales the truncated normal distribution
+    with a factor of 1.0.
+
+    Args:
+        weights (torch.Tensor): Tensor to initialize
+    """
     trunc_normal_init_(weights, scale=1.0)
 
 
 def he_normal_init_(weights):
+    """
+    Applies He normal initialization to weights.
+
+    He initialization scales the truncated normal distribution
+    with a factor of 2.0, optimized for ReLU activations.
+
+    Args:
+        weights (torch.Tensor): Tensor to initialize
+    """
     trunc_normal_init_(weights, scale=2.0)
 
 
 def glorot_uniform_init_(weights):
+    """
+    Applies Glorot/Xavier uniform initialization to weights.
+
+    Initializes weights using a uniform distribution scaled
+    by the average of fan-in and fan-out.
+
+    Args:
+        weights (torch.Tensor): Tensor to initialize
+    """
     nn.init.xavier_uniform_(weights, gain=1)
 
 
 def final_init_(weights):
+    """
+    Initializes all weights to zero.
+
+    Typically used for the final layer of a network to zero
+    out initial outputs.
+
+    Args:
+        weights (torch.Tensor): Tensor to initialize
+    """
     with torch.no_grad():
         weights.fill_(0.0)
 
 
 def gating_init_(weights):
+    """
+    Initializes weights for gating mechanisms to zero.
+
+    Used for gating layers where the initial behavior should
+    be to pass through inputs unchanged.
+
+    Args:
+        weights (torch.Tensor): Tensor to initialize
+    """
     with torch.no_grad():
         weights.fill_(0.0)
 
 
 def normal_init_(weights):
+    """
+    Applies Kaiming normal initialization with linear scaling.
+
+    Initializes weights using the Kaiming normal distribution
+    with the "linear" nonlinearity setting.
+
+    Args:
+        weights (torch.Tensor): Tensor to initialize
+    """
     torch.nn.init.kaiming_normal_(weights, nonlinearity="linear")
 
 
 def ipa_point_weights_init_(weights):
+    """
+    Initializes weights for invariant point attention.
+
+    Sets all weights to softplus_inverse_1 (0.541324854612918),
+    a specific value used in the IPA architecture.
+
+    Args:
+        weights (torch.Tensor): Tensor to initialize
+    """
     with torch.no_grad():
         softplus_inverse_1 = 0.541324854612918
         weights.fill_(softplus_inverse_1)
@@ -163,6 +269,16 @@ class Linear(nn.Linear):
                     raise ValueError("Invalid init string.")
 
 class LayerNorm(nn.Module):
+    """
+    Custom Layer Normalization with bfloat16 handling.
+
+    Implements layer normalization with special handling for bfloat16 precision,
+    particularly useful when working with mixed precision training or DeepSpeed.
+
+    Args:
+        c_in (int): Number of input features
+        eps (float): Small constant for numerical stability. Default: 1e-5
+    """
     def __init__(self, c_in, eps=1e-5):
         super(LayerNorm, self).__init__()
 

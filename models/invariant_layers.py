@@ -3,7 +3,155 @@ import torch.nn as nn
 from torch_scatter import scatter_sum, scatter_softmax, scatter_mean
 import numpy as np
 
+class EnergyPredictor(nn.Module):
+    """
+    Energy prediction component that leverages invariant layer outputs.
 
+    This module uses the rich structural and interaction representations
+    already computed by the invariant layers to predict binding energy.
+
+    Args:
+        args (object): Configuration object with model parameters
+        fold_dim (int): Dimension of the network embeddings
+    """
+    def __init__(self, args, fold_dim):
+        super(EnergyPredictor, self).__init__()
+        self.args = args
+
+        # Global attention pooling for protein features
+        self.protein_attention = nn.Sequential(
+            nn.Linear(fold_dim, fold_dim // 2),
+            nn.ReLU(),
+            nn.Linear(fold_dim // 2, 1)
+        )
+
+        # Global attention pooling for ligand features
+        self.ligand_attention = nn.Sequential(
+            nn.Linear(fold_dim, fold_dim // 2),
+            nn.ReLU(),
+            nn.Linear(fold_dim // 2, 1)
+        )
+
+        # Optional: Cross-attention for interaction features
+        self.use_cross_features = args.use_cross_features if hasattr(args, 'use_cross_features') else True
+        if self.use_cross_features:
+            self.cross_attention = nn.Sequential(
+                nn.Linear(fold_dim, fold_dim // 2),
+                nn.ReLU(),
+                nn.Linear(fold_dim // 2, 1)
+            )
+
+        # Feature combination and final prediction
+        input_dim = fold_dim * 2
+        if self.use_cross_features:
+            input_dim += fold_dim
+
+        self.confidence_branch = args.confidence_branch if hasattr(args, 'confidence_branch') else False
+
+        # Main energy prediction MLP
+        self.energy_mlp = nn.Sequential(
+            nn.Linear(input_dim, fold_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(fold_dim, fold_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1)
+        )
+
+        # Final output layers
+        self.energy_output = nn.Linear(fold_dim // 2, 1)
+
+        # Optional confidence score branch
+        if self.confidence_branch:
+            self.confidence_output = nn.Sequential(
+                nn.Linear(fold_dim // 2, fold_dim // 4),
+                nn.ReLU(),
+                nn.Linear(fold_dim // 4, 1),
+                nn.Sigmoid()  # Confidence score between 0 and 1
+            )
+
+    def attention_pooling(self, node_features, attention_network, batch_indices, num_graphs):
+        """
+        Apply attention-based pooling to node features.
+
+        Args:
+            node_features (torch.Tensor): Features per node
+            attention_network (nn.Module): Network to compute attention weights
+            batch_indices (torch.Tensor): Batch assignment for each node
+            num_graphs (int): Number of graphs in the batch
+
+        Returns:
+            torch.Tensor: Pooled features
+        """
+        # Calculate attention scores
+        attention_scores = attention_network(node_features)
+        # Apply softmax per graph
+        attention_weights = scatter_softmax(attention_scores, batch_indices, dim=0)
+        # Weighted average
+        weighted_features = node_features * attention_weights
+        pooled_features = scatter_sum(weighted_features, batch_indices, dim=0, dim_size=num_graphs)
+        return pooled_features
+
+    def forward(self, rec_na, lig_na, cross_ea, cross_idx, protein_batch, ligand_batch):
+        """
+        Forward pass of the EnergyPredictor.
+
+        Args:
+            rec_na (torch.Tensor): Protein node features from invariant layers
+            lig_na (torch.Tensor): Ligand node features from invariant layers
+            cross_ea (torch.Tensor): Cross-edge features from invariant layers
+            cross_idx (torch.Tensor): Cross-edge indices
+            protein_batch (torch.Tensor): Batch indices for protein nodes
+            ligand_batch (torch.Tensor): Batch indices for ligand nodes
+
+        Returns:
+            tuple: (energy_prediction, confidence_score) if confidence_branch=True
+                  energy_prediction otherwise
+        """
+        # Get the number of graphs in the batch
+        num_graphs = ligand_batch.max().item() + 1
+
+        # Apply attention pooling to protein and ligand features
+        protein_pooled = self.attention_pooling(
+            rec_na,
+            self.protein_attention,
+            protein_batch,
+            num_graphs
+        )
+
+        ligand_pooled = self.attention_pooling(
+            lig_na,
+            self.ligand_attention,
+            ligand_batch,
+            num_graphs
+        )
+
+        # Combine features
+        if self.use_cross_features and cross_ea is not None:
+            # Pool cross-edge features
+            complex_ids = ligand_batch[cross_idx[0]]
+            cross_pooled = self.attention_pooling(
+                cross_ea,
+                self.cross_attention,
+                complex_ids,
+                num_graphs
+            )
+            # Concatenate all features
+            combined_features = torch.cat([protein_pooled, ligand_pooled, cross_pooled], dim=1)
+        else:
+            # Just use protein and ligand features
+            combined_features = torch.cat([protein_pooled, ligand_pooled], dim=1)
+
+        # Process through MLP
+        features = self.energy_mlp(combined_features)
+        energy = self.energy_output(features)
+
+        if self.confidence_branch:
+            confidence = self.confidence_output(features)
+            return energy, confidence
+        else:
+            return energy
+        
 class InvariantLayer(nn.Module):
     def __init__(self, args, device, update_edges=True):
         super(InvariantLayer, self).__init__()

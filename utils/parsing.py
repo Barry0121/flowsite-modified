@@ -197,7 +197,11 @@ def parse_train_args(args=sys.argv[1:]):
     parser.add_argument('--node_context', action='store_true', default=False)
     parser.add_argument('--drop_tfn_feat', action='store_true', default=False)
     parser.add_argument('--inv_straight_combine', action='store_true', default=False)
+
+    ## Energy prediction
     parser.add_argument('--energy_predictor', action='store_true', default=False)
+    parser.add_argument('--confidence_branch', action='store_true', default=False)
+    parser.add_argument('--use_cross_features', action='store_true', default=False)
 
     # Optional additional initial MPNN embeddings for the ligand
     parser.add_argument('--lig2d_mpnn', action='store_true', default=False, help='')

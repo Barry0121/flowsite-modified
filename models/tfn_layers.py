@@ -17,16 +17,55 @@ ACTIVATIONS = {
     'tanh': nn.Tanh,
 }
 class ConvGraph():
+    """
+    Container class for graph convolution data.
+
+    Stores edge indices, edge attributes, and spherical harmonic representations for use in
+    tensor field network operations.
+
+    Args:
+        idx (torch.Tensor): Edge indices of shape [2, num_edges] containing source and destination node indices.
+        attr (torch.Tensor): Edge attributes/features.
+        sh (torch.Tensor): Spherical harmonic representations of edge vectors.
+    """
     def __init__(self, idx, attr, sh):
         self.idx = idx
         self.attr = attr
         self.sh = sh
 
-
-
-
-
 class RefinementTFNLayer(torch.nn.Module):
+    """
+    Refinement Tensor Field Network (TFN) Layer for molecular modeling.
+
+    This layer implements a graph neural network with equivariant tensor field operations
+    for refining the positions and features of ligand molecules in the context of a receptor.
+    The layer handles ligand-ligand, ligand-receptor, and receptor-receptor interactions.
+
+    Args:
+        args: Configuration object containing the following parameters:
+            ns (int): Number of scalar features.
+            nv (int): Number of vector features.
+            order (int): Maximum order of spherical harmonics for feature representations.
+            sh_lmax (int): Maximum order of spherical harmonics for edge representations.
+            lig_radius (float): Radius for ligand-ligand interactions.
+            cross_radius (float): Radius for ligand-receptor interactions.
+            radius_emb_dim (int): Dimension of radius embedding.
+            fancy_init (bool): Whether to use special weight initialization.
+            batch_norm (bool): Whether to use batch normalization.
+            residual (bool): Whether to use residual connections.
+            fc_dim (int): Hidden dimension of fully connected layers.
+            faster (bool): Whether to use the faster tensor product implementation.
+            no_tfn_rec2rec (bool): If True, disable receptor-receptor interactions.
+            no_damping_factor (bool): If True, disable the damping factor for position updates.
+            separate_update (bool): If True, use separate update for ligand nodes.
+            fixed_lig_pos (bool): If True, fix ligand positions.
+            update_last_when_fixed (bool): If True, update positions in the last layer even if fixed.
+            feedforward (bool): Whether to use feedforward layers.
+            pre_norm (bool): Whether to use layer normalization before feedforward.
+            self_condition_bit (bool): Whether to use self-conditioning.
+            post_norm (bool): Whether to use layer normalization after the update.
+        last_layer (bool, optional): Whether this is the last layer in the network. Defaults to False.
+    """
     def  __init__(self, args, last_layer=False):
         super().__init__()
         self.args = args
@@ -182,6 +221,25 @@ class RefinementTFNLayer(torch.nn.Module):
         return lig_pos, lig_na, rec_na
 
 class TensorProductConvLayer(torch.nn.Module):
+    """
+    Tensor Product Convolution Layer for equivariant graph neural networks.
+
+    Implements a graph convolution that preserves SO(3) equivariance using tensor products
+    between node features and spherical harmonic edge features.
+
+    Args:
+        in_irreps (o3.Irreps): Input irreducible representations.
+        sh_irreps (o3.Irreps): Spherical harmonic irreducible representations.
+        out_irreps (o3.Irreps): Output irreducible representations.
+        n_edge_features (int): Number of edge features.
+        residual (bool, optional): Whether to use residual connections. Defaults to True.
+        batch_norm (bool, optional): Whether to use batch normalization. Defaults to False.
+        layer_norm (bool, optional): Whether to use layer normalization. Defaults to False.
+        dropout (float, optional): Dropout probability. Defaults to 0.0.
+        hidden_features (int, optional): Number of hidden features in the edge network.
+                                         Defaults to n_edge_features if None.
+        faster (bool, optional): Whether to use the faster tensor product implementation. Defaults to False.
+    """
     def __init__(
         self,
         in_irreps,
@@ -236,12 +294,35 @@ class TensorProductConvLayer(torch.nn.Module):
         return out
 
 def get_edge_attr(conv_graph, node_attr1, node_attr2=None, ns=None):
+    """
+    Constructs edge attributes by concatenating edge features with node features.
+
+    Args:
+        conv_graph (ConvGraph): Graph container with edge indices and attributes.
+        node_attr1 (torch.Tensor): Features of source nodes.
+        node_attr2 (torch.Tensor, optional): Features of destination nodes.
+                                             If None, use node_attr1. Defaults to None.
+        ns (int, optional): Number of scalar features to use from node attributes. Defaults to None.
+
+    Returns:
+        torch.Tensor: Concatenated edge attributes.
+    """
     if node_attr2 is None:
         node_attr2 = node_attr1
     src, dst = conv_graph.idx
     return torch.cat([conv_graph.attr, node_attr1[src, :ns], node_attr2[dst, :ns]], -1)
 
 class GaussianSmearing(torch.nn.Module):
+    """
+    Gaussian smearing module for embedding distances.
+
+    Transforms scalar distances into a vector of Gaussian basis functions.
+
+    Args:
+        start (float, optional): Minimum distance. Defaults to 0.0.
+        stop (float, optional): Maximum distance. Defaults to 5.0.
+        num_gaussians (int, optional): Number of Gaussian basis functions. Defaults to 50.
+    """
     # used to embed the edge distances
     def __init__(self, start=0.0, stop=5.0, num_gaussians=50):
         super().__init__()
@@ -265,6 +346,28 @@ def build_cg(
     pos_self=None,
     pos_prior=None
 ):
+    """
+    Builds a ConvGraph object for tensor field network operations.
+
+    Creates edge attributes and spherical harmonic representations for edges in a graph.
+    Can handle both single-graph and cross-graph (bipartite) scenarios.
+
+    Args:
+        pos (torch.Tensor or tuple): Node positions. If tuple, (pos1, pos2) for bipartite graphs.
+        edge_attr (torch.Tensor): Edge attributes, can be None.
+        edge_index (torch.Tensor): Edge indices, can be None.
+        radius_emb_func (callable): Function to embed distances.
+        sh_irreps (str, optional): Spherical harmonic irreps string. Defaults to "1x0e+1x1e".
+        batch (torch.Tensor or tuple, optional): Batch indices for nodes. If tuple, (batch1, batch2). Defaults to None.
+        radius (float or tuple, optional): Radius for neighborhood construction.
+                                          If tuple, (radius1, radius2). Defaults to None.
+        time_embedding (torch.Tensor, optional): Time embeddings to add to edge features. Defaults to None.
+        pos_self (torch.Tensor or tuple, optional): Self positions for additional edge features. Defaults to None.
+        pos_prior (torch.Tensor or tuple, optional): Prior positions for additional edge features. Defaults to None.
+
+    Returns:
+        ConvGraph: Graph container with edge indices, attributes, and spherical harmonics.
+    """
     if isinstance(pos, tuple):
         pos1, pos2 = pos
         batch1, batch2 = batch or (None, None)
@@ -325,6 +428,22 @@ def build_cg(
 
 
 class FasterTensorProduct(torch.nn.Module):
+    """
+    Optimized tensor product implementation for SO(3)-equivariant neural networks.
+
+    This is a faster implementation of the tensor product operation that works with
+    spherical harmonic representations up to first order (L=1).
+
+    Args:
+        in_irreps (o3.Irreps): Input irreducible representations.
+        sh_irreps (o3.Irreps): Spherical harmonic irreducible representations (must be 1x0e+1x1o).
+        out_irreps (o3.Irreps): Output irreducible representations.
+        **kwargs: Additional keyword arguments (unused).
+
+    Note:
+        This implementation only supports irreps with L=0 and L=1 for both input and output.
+        The spherical harmonics must be first order (L=0,1).
+    """
     def __init__(self, in_irreps, sh_irreps, out_irreps, **kwargs):
         super().__init__()
         #for ir in in_irreps:

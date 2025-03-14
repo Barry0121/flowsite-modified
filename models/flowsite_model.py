@@ -13,7 +13,7 @@ from torch_geometric.nn import PNAConv, BatchNorm
 from torch_geometric.utils import unbatch
 from torch_scatter import scatter_mean, scatter_softmax, scatter_sum
 
-from models.invariant_layers import InvariantLayer
+from models.invariant_layers import InvariantLayer, EnergyPredictor
 from models.pytorch_modules import Linear, Encoder
 from models.tfn_layers import RefinementTFNLayer, build_cg, GaussianSmearing
 from utils.diffusion import get_time_mapping
@@ -43,6 +43,7 @@ class FlowSiteModel(nn.Module):
             - num_inv_layers (int): Number of invariant network layers
             - use_tfn (bool): Whether to use tensor field networks
             - use_inv (bool): Whether to use invariant networks
+            - energy_predictor (bool): Whether to apply energy prediciton head
             - ignore_lig (bool): Whether to ignore ligand features
             - lig2d_mpnn (bool): Whether to use 2D message passing for ligands
             - fancy_init (bool): Whether to use special weight initialization
@@ -140,51 +141,16 @@ class FlowSiteModel(nn.Module):
                 self.rec_tfn2inv = nn.Sequential(Linear(args.ns, args.ns), nn.ReLU(), Linear(args.ns, fold_dim))
         assert not ((args.time_condition_inv or args.time_condition_tfn) and args.ignore_lig), "It does not make sense to use time conditioning without the ligand and therefore without diffusion."
 
-        # ADD: energy prediction components
+        # Energy prediction components
         if self.args.energy_predictor:
-            # Attention mechanism for protein and ligand nodes
-            self.protein_attention = nn.Sequential(nn.Linear(fold_dim, fold_dim // 2), nn.ReLU(), nn.Linear(fold_dim // 2, 1))
-            self.ligand_attention = nn.Sequential(nn.Linear(fold_dim, fold_dim // 2), nn.ReLU(), nn.Linear(fold_dim // 2, 1))
+            self.energy_model = EnergyPredictor(self.args, fold_dim)
+            # Check the confidence scoring feature
+            if not hasattr(self.args, 'confidence_branch'):
+                self.args.confidence_branch = True
+            # Check for cross features flag
+            if not hasattr(self.args, 'use_cross_features'):
+                self.args.use_cross_features = True
 
-            # Interaction feature processing (input dim = protein + ligand + edge features)
-            self.interaction_mlp = nn.Sequential(nn.Linear(fold_dim * 2 + fold_dim, fold_dim), nn.ReLU(), nn.Dropout(0.1), nn.Linear(fold_dim, fold_dim))
-
-            # Attention for interaction features
-            self.interaction_attention = nn.Sequential(nn.Linear(fold_dim, fold_dim // 2), nn.ReLU(), nn.Linear(fold_dim // 2, 1))
-
-            # Final energy prediction MLP (input dim = protein + ligand + interaction features)
-            self.energy_mlp = nn.Sequential(
-                nn.Linear(fold_dim * 3, fold_dim), nn.ReLU(), nn.Dropout(0.1), nn.Linear(fold_dim, fold_dim // 2),
-                nn.ReLU(), nn.Dropout(0.1), nn.Linear(fold_dim // 2, 1)
-            )
-
-    def attention_pooling(self, node_features, attention_network, batch_indices, num_graphs):
-        # Calculate attention scores
-        attention_scores = attention_network(node_features)
-        # Apply softmax per graph
-        attention_weights = scatter_softmax(attention_scores, batch_indices, dim=0)
-        # Weighted average
-        weighted_features = node_features * attention_weights
-        pooled_features = scatter_sum(weighted_features, batch_indices, dim=0, dim_size=num_graphs)
-        return pooled_features
-
-    def compute_interaction_features(self, protein_nodes, ligand_nodes, cross_idx, cross_ea, protein_batch, num_graphs):
-        # Extract interacting protein and ligand nodes
-        protein_interacting = protein_nodes[cross_idx[1]]
-        ligand_interacting = ligand_nodes[cross_idx[0]]
-        # Combine with edge features
-        interaction_features = torch.cat([protein_interacting, ligand_interacting, cross_ea], dim=1)
-        # Process through MLP
-        interaction_features = self.interaction_mlp(interaction_features)
-        # Use attention to pool by complex
-        complex_ids = protein_batch[cross_idx[1]]
-        interaction_pooled = self.attention_pooling(
-            interaction_features,
-            self.interaction_attention,
-            complex_ids,
-            num_graphs
-        )
-        return interaction_pooled
 
     def forward(self, data, x_self=None, x_prior= None):
         """
@@ -284,44 +250,34 @@ class FlowSiteModel(nn.Module):
 
         # Calculate binding energy
         binding_energy = None
+        confidence_score = None
         if self.energy_predictor and not self.args.ignore_lig and not (lig_na is None):
-            # Get the number of graphs in the batch (correspond to the number of ligands)
-            num_graphs = data.num_graphs
-
-            # Apply attention pooling to protein and ligand features
-            protein_pooled = self.attention_pooling(
-                rec_na,
-                self.protein_attention,
-                data['protein'].batch,
-                num_graphs
-            )
-            ligand_pooled = self.attention_pooling(
-                lig_na,
-                self.ligand_attention,
-                data['ligand'].batch,
-                num_graphs
-            )
-
-            # Compute interaction features
-            interaction_pooled = self.compute_interaction_features(
-                rec_na,
-                lig_na,
-                cross_idx,
-                cross_ea,
-                data['protein'].batch,
-                num_graphs
-            )
-
-            # Concatenate all features for the final energy prediction
-            complex_features = torch.cat([protein_pooled, ligand_pooled, interaction_pooled], dim=1)
-            binding_energy = self.energy_mlp(complex_features)
+            if self.args.confidence_branch:
+                binding_energy, confidence_score = self.energy_model(
+                    rec_na,
+                    lig_na,
+                    cross_ea,
+                    cross_idx,
+                    data['protein'].batch,
+                    data['ligand'].batch
+                )
+            else:
+                binding_energy = self.energy_model(
+                    rec_na,
+                    lig_na,
+                    cross_ea,
+                    cross_idx,
+                    data['protein'].batch,
+                    data['ligand'].batch
+                )
 
 
         return (
             logits,
             lig_pos_stack if self.args.use_tfn else torch.stack([data['ligand'].pos]), # if not TFN, return the original positions but stacked.
             angles,
-            binding_energy
+            binding_energy,
+            confidence_score if self.args.energy_predictor and self.args.confidence_branch else None
         )
 
 class TensorFieldNet(nn.Module):

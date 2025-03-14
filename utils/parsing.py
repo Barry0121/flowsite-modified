@@ -202,6 +202,8 @@ def parse_train_args(args=sys.argv[1:]):
     parser.add_argument('--energy_predictor', action='store_true', default=False)
     parser.add_argument('--confidence_branch', action='store_true', default=False)
     parser.add_argument('--use_cross_features', action='store_true', default=False)
+    parser.add_argument('--energy_loss_weight', type=float, default=0.0, help='Weight for the energy prediction loss')
+    parser.add_argument('--confidence_loss_weight', type=float, default=0.0, help='Weight for the confidence prediction loss')
 
     # Optional additional initial MPNN embeddings for the ligand
     parser.add_argument('--lig2d_mpnn', action='store_true', default=False, help='')
